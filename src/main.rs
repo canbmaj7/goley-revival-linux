@@ -1,8 +1,10 @@
 mod api;
 mod config;
+mod desktop;
 mod prefix;
 mod runner;
 mod ui;
+mod userdata;
 
 use adw::prelude::*;
 use std::env;
@@ -10,6 +12,8 @@ use std::env;
 const APP_ID: &str = "io.github.fuwia.GoleyRevivalLinux";
 
 fn main() -> gtk::glib::ExitCode {
+    desktop::ensure_game_window_entry();
+
     let raw_args: Vec<String> = env::args().collect();
     let mut snapshot_target = None;
     let mut filtered_args = Vec::new();

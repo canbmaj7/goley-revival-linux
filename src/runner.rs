@@ -1,9 +1,10 @@
 use crate::config::{which_binary, AppConfig};
 use crate::prefix::{
-    atomic_write_file, find_running_pids, install_ncrypt_shims, revival_launcher_log_path,
-    revival_local_appdata_dir, revival_root_dir, select_runner, write_login_prefs_to_user_reg,
-    RunnerKind,
+    atomic_write_file, find_running_pids, install_ncrypt_shims, resolve_wine_user_dir,
+    revival_launcher_log_path, revival_local_appdata_dir, revival_root_dir, select_runner,
+    write_login_prefs_to_user_reg, RunnerKind,
 };
+use crate::userdata;
 use async_channel::Sender;
 use std::fs;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -44,6 +45,16 @@ struct LaunchWatch {
     seen_launcher: bool,
     missing_since: Option<Instant>,
     phase: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeStateSnapshot {
+    pub log_len: u64,
+    pub status_content: Option<String>,
+}
+
+pub fn has_bridge_progress(last: &BridgeStateSnapshot, current: &BridgeStateSnapshot) -> bool {
+    current.log_len > last.log_len || current.status_content != last.status_content
 }
 
 impl LaunchWatch {
@@ -183,6 +194,30 @@ fn run_session_inner(
         std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "bilinmiyor".into()),
     )));
 
+    let pristine: std::collections::HashMap<String, String> = match crate::api::fetch_remote_manifests() {
+        Ok(manifests) => {
+            let mut map = std::collections::HashMap::new();
+            for f in &manifests.game.files {
+                let normalized = f.path.replace('\\', "/");
+                if userdata::PROTECTED_FILES.contains(&normalized.as_str()) {
+                    map.insert(normalized, f.sha256.to_lowercase());
+                }
+            }
+            map
+        }
+        Err(err) => {
+            let _ = tx.send_blocking(RunnerEvent::LogLine(format!(
+                "[goley-revival-linux] Resmî sunucu manifestosu alınamadı ({}); oyun ayarları yakalaması bu oturumda atlanıyor.",
+                err
+            )));
+            std::collections::HashMap::new()
+        }
+    };
+
+    for msg in userdata::capture(prefix, &pristine) {
+        let _ = tx.send_blocking(RunnerEvent::LogLine(msg));
+    }
+
     if !launcher_exe.is_file() {
         return Err(
             "revival_launcher.exe bulunamadı. Lütfen önce 'Oyunu İndir / Güncelle' butonuna tıklayın."
@@ -196,7 +231,7 @@ fn run_session_inner(
     let (existing_game_pid, mut existing_launcher_pid) = find_running_pids();
     if let Some(gpid) = existing_game_pid {
         let _ = tx.send_blocking(RunnerEvent::GameRunning { pid: gpid });
-        monitor_until_exit(prefix, tx);
+        monitor_until_exit(prefix, &pristine, tx);
         return Ok(());
     }
 
@@ -223,6 +258,9 @@ fn run_session_inner(
         )));
         if let Ok(meta) = fs::metadata(&log_path) {
             log_offset = meta.len();
+        }
+        for msg in userdata::restore(prefix) {
+            let _ = tx.send_blocking(RunnerEvent::LogLine(msg));
         }
         if let Some(ref c) = creds {
             let _ = tx.send_blocking(RunnerEvent::Status {
@@ -309,6 +347,7 @@ fn run_session_inner(
     // 3. Tail launcher.log and drive the headless bridge state machine
     let start_wait = Instant::now();
     let mut phase_ready = existing_launcher_pid.is_some();
+    let mut restored_settings = existing_launcher_pid.is_some();
     let mut ready_since: Option<Instant> = if existing_launcher_pid.is_some() {
         Some(Instant::now())
     } else {
@@ -332,8 +371,32 @@ fn run_session_inner(
         None
     };
     let mut ticket_requested = false;
+    let status_path = revival_local_appdata_dir(prefix).join("goley_bridge_status.txt");
+    let mut bridge_cmd_sent = existing_launcher_pid.is_some();
+    let mut last_bridge_progress_at = Instant::now();
+    let mut last_bridge_snapshot = BridgeStateSnapshot {
+        log_len: fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0),
+        status_content: fs::read_to_string(&status_path).ok(),
+    };
 
     loop {
+        let cur_snapshot = BridgeStateSnapshot {
+            log_len: fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0),
+            status_content: fs::read_to_string(&status_path).ok(),
+        };
+        if has_bridge_progress(&last_bridge_snapshot, &cur_snapshot) {
+            last_bridge_snapshot = cur_snapshot;
+            last_bridge_progress_at = Instant::now();
+        } else if bridge_cmd_sent && last_bridge_progress_at.elapsed() >= Duration::from_secs(20) {
+            let err_msg = format!(
+                "Gizli başlatıcı komuta yanıt vermiyor. Wine kullanıcı klasörü: {}. Log: {}",
+                revival_local_appdata_dir(prefix).display(),
+                log_path.display()
+            );
+            let _ = tx.send_blocking(RunnerEvent::LogLine(err_msg.clone()));
+            stop_launcher_only(prefix);
+            return Err(err_msg);
+        }
         // Check if BinaryTrU.exe is already running!
         let (game_pid, launcher_pid) = find_running_pids();
         if let Some(gpid) = game_pid {
@@ -343,7 +406,7 @@ fn run_session_inner(
                 gpid
             )));
             let _ = tx.send_blocking(RunnerEvent::GameRunning { pid: gpid });
-            monitor_until_exit(prefix, tx);
+            monitor_until_exit(prefix, &pristine, tx);
             return Ok(());
         }
 
@@ -418,6 +481,12 @@ fn run_session_inner(
                             watch.phase = "başlatıcının hazır olması";
                             phase_ready = true;
                             ready_since = Some(Instant::now());
+                            if !restored_settings {
+                                restored_settings = true;
+                                for msg in userdata::restore(prefix) {
+                                    let _ = tx.send_blocking(RunnerEvent::LogLine(msg));
+                                }
+                            }
                         } else if let Some(idx) = trimmed.find("AuthClient: login failed ->") {
                             let reason = trimmed[idx + "AuthClient: login failed ->".len()..]
                                 .trim()
@@ -440,9 +509,17 @@ fn run_session_inner(
                                 pulsing: true,
                             });
                             std::thread::sleep(Duration::from_millis(350));
+                            if !restored_settings {
+                                restored_settings = true;
+                                for msg in userdata::restore(prefix) {
+                                    let _ = tx.send_blocking(RunnerEvent::LogLine(msg));
+                                }
+                            }
                             send_bridge_command(prefix, "PLAY\n")?;
                             watch.phase = "OYNA komutuna yanıt";
                             play_sent_at = Some(Instant::now());
+                            bridge_cmd_sent = true;
+                            last_bridge_progress_at = Instant::now();
                         } else if trimmed.contains("AuthClient: ticket requested") {
                             watch.phase = "sunucudan giriş bileti yanıtı";
                             ticket_requested = true;
@@ -506,10 +583,18 @@ fn run_session_inner(
                             detail: format!("{} doğrulanıyor", c.username),
                             pulsing: true,
                         });
+                        if !restored_settings {
+                            restored_settings = true;
+                            for msg in userdata::restore(prefix) {
+                                let _ = tx.send_blocking(RunnerEvent::LogLine(msg));
+                            }
+                        }
                         send_bridge_command(
                             prefix,
                             &format!("LOGIN\t{}\t{}\n", c.username, c.password),
                         )?;
+                        bridge_cmd_sent = true;
+                        last_bridge_progress_at = Instant::now();
                     }
                 } else if elapsed_ready >= Duration::from_millis(300) {
                     let _ = tx.send_blocking(RunnerEvent::NeedLogin { reason: None });
@@ -521,9 +606,17 @@ fn run_session_inner(
                     detail: "Gizli köprü üzerinden OYNA komutu gönderildi".to_string(),
                     pulsing: true,
                 });
+                if !restored_settings {
+                    restored_settings = true;
+                    for msg in userdata::restore(prefix) {
+                        let _ = tx.send_blocking(RunnerEvent::LogLine(msg));
+                    }
+                }
                 send_bridge_command(prefix, "PLAY\n")?;
                 watch.phase = "OYNA komutuna yanıt";
                 play_sent_at = Some(Instant::now());
+                bridge_cmd_sent = true;
+                last_bridge_progress_at = Instant::now();
             } else if let Some(sent_time) = play_sent_at {
                 // Retry PLAY if ticket wasn't requested after 2.4s (e.g., session restore just finished)
                 if !ticket_requested && sent_time.elapsed() >= Duration::from_millis(2400) {
@@ -537,19 +630,30 @@ fn run_session_inner(
     }
 }
 
-fn monitor_until_exit(prefix: &Path, tx: &Sender<RunnerEvent>) {
+fn monitor_until_exit(
+    prefix: &Path,
+    pristine: &std::collections::HashMap<String, String>,
+    tx: &Sender<RunnerEvent>,
+) {
     loop {
         std::thread::sleep(Duration::from_millis(1500));
         let (game_pid, _) = find_running_pids();
         if game_pid.is_none() {
             // Game closed -> cleanly close hidden revival_launcher.exe too
             let _ = send_bridge_command(prefix, "QUIT\n");
+            for msg in userdata::capture(prefix, pristine) {
+                let _ = tx.send_blocking(RunnerEvent::LogLine(msg));
+            }
             let _ = tx.send_blocking(RunnerEvent::LogLine(
                 "[goley-revival-linux] Oyun kapandı, arka plan başlatıcısı sonlandırıldı."
                     .to_string(),
             ));
             let _ = tx.send_blocking(RunnerEvent::GameExited);
             break;
+        } else {
+            for msg in userdata::capture(prefix, pristine) {
+                let _ = tx.send_blocking(RunnerEvent::LogLine(msg));
+            }
         }
     }
 }
@@ -589,11 +693,9 @@ fn build_runner_command(
             cmd.env("FAUGUSID", "revival");
             cmd.env("LOG_DIR", "revival");
             if let Some(pdir) = proton_dir {
-                if let Some(name) = pdir.file_name().and_then(|s| s.to_str()) {
-                    cmd.env("PROTONPATH", name);
-                } else {
-                    cmd.env("PROTONPATH", pdir);
-                }
+                // umu 1.4.x, yalnızca klasör adını (ör. "proton-ge-custom") çözemiyor;
+                // her zaman tam yol ver.
+                cmd.env("PROTONPATH", pdir);
             }
             apply_common_envs(&mut cmd, cfg);
             Ok(cmd)
@@ -616,6 +718,13 @@ fn build_runner_command(
             base_args.push(launcher_exe.to_string_lossy().to_string());
             let mut cmd = assemble_wrapped_command(&wrappers, &base_args);
             cmd.env("WINEPREFIX", &cfg.prefix_path);
+            let wine_user = resolve_wine_user_dir(&cfg.prefix_path);
+            let user_name = wine_user
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("steamuser");
+            cmd.env("USER", user_name);
+            cmd.env("LOGNAME", user_name);
             apply_common_envs(&mut cmd, cfg);
             Ok(cmd)
         }
@@ -690,5 +799,109 @@ mod tests {
         assert!(!watch.launcher_exited(false, now + Duration::from_secs(5)));
         assert!(!watch.launcher_exited(false, now + Duration::from_secs(7)));
         assert!(watch.launcher_exited(false, now + Duration::from_secs(8)));
+    }
+
+    #[test]
+    fn bridge_progress_detected_on_log_growth() {
+        let s1 = BridgeStateSnapshot {
+            log_len: 100,
+            status_content: None,
+        };
+        let s2 = BridgeStateSnapshot {
+            log_len: 120,
+            status_content: None,
+        };
+        assert!(has_bridge_progress(&s1, &s2));
+    }
+
+    #[test]
+    fn bridge_progress_detected_on_status_change() {
+        let s1 = BridgeStateSnapshot {
+            log_len: 100,
+            status_content: None,
+        };
+        let s2 = BridgeStateSnapshot {
+            log_len: 100,
+            status_content: Some("BUSY".into()),
+        };
+        assert!(has_bridge_progress(&s1, &s2));
+
+        let s3 = BridgeStateSnapshot {
+            log_len: 100,
+            status_content: Some("READY".into()),
+        };
+        assert!(has_bridge_progress(&s2, &s3));
+    }
+
+    #[test]
+    fn bridge_no_progress_when_unchanged_or_shrunk() {
+        let s1 = BridgeStateSnapshot {
+            log_len: 100,
+            status_content: Some("IDLE".into()),
+        };
+        let s2 = BridgeStateSnapshot {
+            log_len: 100,
+            status_content: Some("IDLE".into()),
+        };
+        assert!(!has_bridge_progress(&s1, &s2));
+
+        let shrunk = BridgeStateSnapshot {
+            log_len: 50,
+            status_content: Some("IDLE".into()),
+        };
+        assert!(!has_bridge_progress(&s1, &shrunk));
+    }
+
+    #[test]
+    fn test_wine_runner_command_sets_user_and_logname() {
+        let tmp = std::env::temp_dir().join(format!("goley_runner_wine_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(&tmp);
+        let mut cfg = AppConfig::default();
+        cfg.prefix_path = tmp.clone();
+
+        let kind = RunnerKind::Wine {
+            wine_bin: std::path::PathBuf::from("/usr/bin/wine"),
+        };
+        let launcher = tmp.join("revival_launcher.exe");
+        let cmd = build_runner_command(&cfg, &kind, &launcher).unwrap();
+
+        let envs: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|val| (k.to_string_lossy().to_string(), val.to_string_lossy().to_string()))
+            })
+            .collect();
+
+        assert_eq!(envs.get("USER").map(|s| s.as_str()), Some("steamuser"));
+        assert_eq!(envs.get("LOGNAME").map(|s| s.as_str()), Some("steamuser"));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_wine_runner_command_sets_legacy_user_env() {
+        let tmp = std::env::temp_dir().join(format!("goley_runner_legacy_test_{}", std::process::id()));
+        let user_launcher_dir = tmp.join("drive_c/users/kullanici/AppData/Local/Programs/Revival");
+        let _ = fs::create_dir_all(&user_launcher_dir);
+        let _ = fs::write(user_launcher_dir.join("revival_launcher.exe"), b"");
+
+        let mut cfg = AppConfig::default();
+        cfg.prefix_path = tmp.clone();
+
+        let kind = RunnerKind::Wine {
+            wine_bin: std::path::PathBuf::from("/usr/bin/wine"),
+        };
+        let launcher = tmp.join("revival_launcher.exe");
+        let cmd = build_runner_command(&cfg, &kind, &launcher).unwrap();
+
+        let envs: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|val| (k.to_string_lossy().to_string(), val.to_string_lossy().to_string()))
+            })
+            .collect();
+
+        assert_eq!(envs.get("USER").map(|s| s.as_str()), Some("kullanici"));
+        assert_eq!(envs.get("LOGNAME").map(|s| s.as_str()), Some("kullanici"));
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

@@ -258,6 +258,17 @@ pub fn fetch_remote_manifests() -> Result<RemoteManifests, String> {
     })
 }
 
+/// Oyunun kendi yazdığı/yeniden yazdığı dosyalar (Option.ini, shader'lar vb.) manifestteki varsayılandan
+/// farklı boyutta olur; var olduktan sonra "eksik/güncel değil" sayılmamalı.
+fn is_user_settings_file(rel: &str) -> bool {
+    let norm = rel.replace('\\', "/");
+    // Oyun, shader dosyalarının ilk satırındaki `#line` yolunu kendi kurulum yoluyla
+    // yeniden yazar; boyut manifestten farklı çıkar ama içerik aynıdır.
+    let is_game_rewritten_shader = norm.starts_with("Data/DefaultShader/") && norm.ends_with(".hlsl");
+    is_game_rewritten_shader
+        || crate::userdata::PROTECTED_FILES.iter().any(|p| p.eq_ignore_ascii_case(&norm))
+}
+
 pub fn check_install_status_fast(prefix: &Path, manifests: &RemoteManifests) -> LocalInstallState {
     let rev_root = revival_root_dir(prefix);
     let game_dir = revival_game_dir(prefix);
@@ -293,6 +304,9 @@ pub fn check_install_status_fast(prefix: &Path, manifests: &RemoteManifests) -> 
 
     for f in &manifests.game.files {
         let local_path = game_dir.join(&f.path);
+        if is_user_settings_file(&f.path) && local_path.is_file() {
+            continue;
+        }
         match fs::metadata(&local_path) {
             Ok(meta) if meta.is_file() && meta.len() == f.size => {}
             _ => {
@@ -367,6 +381,7 @@ where
         });
 
         let needs_dl = match fs::metadata(&task.dest_path) {
+            Ok(meta) if meta.is_file() && is_user_settings_file(&task.rel_name) => false,
             Ok(meta) if meta.is_file() && meta.len() == task.size => {
                 if full_sha256_check {
                     match compute_file_sha256(&task.dest_path) {
@@ -392,6 +407,19 @@ where
     }
 
     let total_bytes: u64 = to_download.iter().map(|t| t.size).sum();
+
+    if let Some(available) = get_available_space(&game_dir) {
+        let required = total_bytes as f64 * 1.10;
+        if (available as f64) < required {
+            const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+            return Err(format!(
+                "Yetersiz disk alanı: {:.1} GB gerekli, {:.1} GB boş",
+                required / GB,
+                available as f64 / GB
+            ));
+        }
+    }
+
     let downloaded_bytes = Arc::new(AtomicU64::new(0));
     let files_done = Arc::new(AtomicU64::new(0));
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -423,7 +451,7 @@ where
                 };
                 let Some(task) = next_task else { break };
 
-                if let Err(e) = download_single_object(&http, &base_url, &task, &dl_bytes, &cancel) {
+                if let Err(e) = download_single_object_with_retry(&http, &base_url, &task, &dl_bytes, &cancel) {
                     cancel.store(true, Ordering::Relaxed);
                     let mut g = err_slot.lock().unwrap();
                     if g.is_none() {
@@ -479,6 +507,192 @@ where
     Ok(files_total)
 }
 
+fn parse_df_available(output: &str) -> Option<u64> {
+    let mut lines = output.lines().filter(|l| !l.trim().is_empty());
+    let _header = lines.next()?;
+    for line in lines {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 4 {
+            if let Ok(available) = parts[3].parse::<u64>() {
+                return Some(available);
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn get_available_space(path: &Path) -> Option<u64> {
+    use std::process::Command;
+    let target = if path.exists() {
+        path
+    } else if let Some(parent) = path.parent() {
+        if parent.exists() {
+            parent
+        } else {
+            path
+        }
+    } else {
+        path
+    };
+    let output = Command::new("df")
+        .arg("-P")
+        .arg("-B1")
+        .arg(target)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_df_available(&stdout)
+}
+
+fn part_path_for(dest: &Path) -> PathBuf {
+    let mut tmp_name = dest.as_os_str().to_owned();
+    tmp_name.push(".goley_part");
+    PathBuf::from(tmp_name)
+}
+
+fn is_http_client_error(err: &str) -> bool {
+    if err.contains("client error") {
+        return true;
+    }
+    for code in 400..=499 {
+        let pattern1 = format!("({})", code);
+        let pattern2 = format!("({} ", code);
+        let pattern3 = format!("status: {}", code);
+        let pattern4 = format!("status {}", code);
+        if err.contains(&pattern1)
+            || err.contains(&pattern2)
+            || err.contains(&pattern3)
+            || err.contains(&pattern4)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_http_server_error(err: &str) -> bool {
+    if err.contains("server error") {
+        return true;
+    }
+    for code in 500..=599 {
+        let pattern1 = format!("({})", code);
+        let pattern2 = format!("({} ", code);
+        let pattern3 = format!("status: {}", code);
+        let pattern4 = format!("status {}", code);
+        if err.contains(&pattern1)
+            || err.contains(&pattern2)
+            || err.contains(&pattern3)
+            || err.contains(&pattern4)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_retryable_error(err: &str) -> bool {
+    if err == "İndirme iptal edildi" {
+        return false;
+    }
+    if err.starts_with("İndirme hatası (") {
+        return true;
+    }
+    if err.starts_with("Ağ okuma hatası (") {
+        return true;
+    }
+    if err.starts_with("SHA-256 doğrulama hatası (") {
+        return true;
+    }
+    if err.starts_with("CDN HTTP hatası (") {
+        if is_http_client_error(err) {
+            return false;
+        }
+        if is_http_server_error(err) {
+            return true;
+        }
+        return false;
+    }
+    false
+}
+
+fn cancellable_sleep(duration: Duration, cancel: &Arc<AtomicBool>) -> bool {
+    let step = Duration::from_millis(50);
+    let mut elapsed = Duration::ZERO;
+    while elapsed < duration {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        let this_step = step.min(duration - elapsed);
+        std::thread::sleep(this_step);
+        elapsed += this_step;
+    }
+    !cancel.load(Ordering::Relaxed)
+}
+
+fn run_with_retry<F>(
+    mut attempt_fn: F,
+    cancel: &Arc<AtomicBool>,
+    delays: &[Duration],
+) -> Result<(), String>
+where
+    F: FnMut() -> Result<(), String>,
+{
+    const MAX_ATTEMPTS: usize = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("İndirme iptal edildi".to_string());
+        }
+
+        match attempt_fn() {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if cancel.load(Ordering::Relaxed) || err == "İndirme iptal edildi" {
+                    return Err("İndirme iptal edildi".to_string());
+                }
+
+                if !is_retryable_error(&err) {
+                    return Err(err);
+                }
+
+                if attempt >= MAX_ATTEMPTS {
+                    return Err(format!("{} (3 deneme sonrası)", err));
+                }
+
+                let delay = delays
+                    .get(attempt - 1)
+                    .copied()
+                    .unwrap_or(Duration::from_secs(4));
+                if !cancellable_sleep(delay, cancel) {
+                    return Err("İndirme iptal edildi".to_string());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn download_single_object_with_retry(
+    client: &Client,
+    patch_base: &str,
+    task: &DownloadTask,
+    dl_bytes: &Arc<AtomicU64>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    const RETRY_DELAYS: [Duration; 3] = [
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+        Duration::from_secs(4),
+    ];
+    run_with_retry(
+        || download_single_object(client, patch_base, task, dl_bytes, cancel),
+        cancel,
+        &RETRY_DELAYS,
+    )
+}
+
 fn download_single_object(
     client: &Client,
     patch_base: &str,
@@ -498,7 +712,7 @@ fn download_single_object(
         .error_for_status()
         .map_err(|e| format!("CDN HTTP hatası ({}): {}", task.rel_name, e))?;
 
-    let tmp_path = task.dest_path.with_extension("goley_part");
+    let tmp_path = part_path_for(&task.dest_path);
     let mut out_file = fs::File::create(&tmp_path)
         .map_err(|e| format!("Dosya oluşturulamadı ({}): {}", task.rel_name, e))?;
 
@@ -509,21 +723,25 @@ fn download_single_object(
     loop {
         if cancel.load(Ordering::Relaxed) {
             let _ = fs::remove_file(&tmp_path);
+            dl_bytes.fetch_sub(written_this_file, Ordering::Relaxed);
             return Err("İndirme iptal edildi".to_string());
         }
-        let n = resp
-            .read(&mut buf)
-            .map_err(|e| {
+        let n = match resp.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
                 let _ = fs::remove_file(&tmp_path);
-                format!("Ağ okuma hatası ({}): {}", task.rel_name, e)
-            })?;
+                dl_bytes.fetch_sub(written_this_file, Ordering::Relaxed);
+                return Err(format!("Ağ okuma hatası ({}): {}", task.rel_name, e));
+            }
+        };
         if n == 0 {
             break;
         }
-        out_file.write_all(&buf[..n]).map_err(|e| {
+        if let Err(e) = out_file.write_all(&buf[..n]) {
             let _ = fs::remove_file(&tmp_path);
-            format!("Disk yazma hatası ({}): {}", task.rel_name, e)
-        })?;
+            dl_bytes.fetch_sub(written_this_file, Ordering::Relaxed);
+            return Err(format!("Disk yazma hatası ({}): {}", task.rel_name, e));
+        }
         hasher.update(&buf[..n]);
         written_this_file += n as u64;
         dl_bytes.fetch_add(n as u64, Ordering::Relaxed);
@@ -544,6 +762,7 @@ fn download_single_object(
 
     fs::rename(&tmp_path, &task.dest_path).map_err(|e| {
         let _ = fs::remove_file(&tmp_path);
+        dl_bytes.fetch_sub(written_this_file, Ordering::Relaxed);
         format!("Dosya yerleştirilemedi ({}): {}", task.rel_name, e)
     })
 }
@@ -875,4 +1094,173 @@ pub fn perform_launcher_self_update(info: &LauncherReleaseInfo) -> Result<PathBu
 
     let _ = fs::remove_dir_all(&tmp_dir);
     Err("Güncelleme dosyası hedef konuma yerleştirilemedi.".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn test_part_path_for_different_extensions() {
+        let vlh = Path::new("/opt/goley/Stadium.VLH");
+        let vld = Path::new("/opt/goley/Stadium.VLD");
+        let part_vlh = part_path_for(vlh);
+        let part_vld = part_path_for(vld);
+
+        assert_ne!(part_vlh, part_vld);
+        assert_eq!(part_vlh, PathBuf::from("/opt/goley/Stadium.VLH.goley_part"));
+        assert_eq!(part_vld, PathBuf::from("/opt/goley/Stadium.VLD.goley_part"));
+        assert!(part_vlh.to_string_lossy().ends_with(".goley_part"));
+        assert!(part_vld.to_string_lossy().ends_with(".goley_part"));
+    }
+
+    #[test]
+    fn test_parse_df_available_valid() {
+        let sample = "Filesystem         1-blocks         Used    Available Capacity Mounted on\n\
+                      /dev/nvme0n1p2 507813089280 130826940416 375391145984      26% /home\n";
+        assert_eq!(parse_df_available(sample), Some(375391145984));
+    }
+
+    #[test]
+    fn test_parse_df_available_broken() {
+        assert_eq!(parse_df_available(""), None);
+        assert_eq!(
+            parse_df_available("Filesystem 1-blocks Used Available Capacity Mounted on\n"),
+            None
+        );
+        assert_eq!(
+            parse_df_available("df: /nonexistent: No such file or directory\n"),
+            None
+        );
+        assert_eq!(
+            parse_df_available(
+                "Filesystem 1-blocks Used Available Capacity Mounted on\n/dev/sda1 100 50 not_a_number 10% /\n"
+            ),
+            None
+        );
+        assert_eq!(parse_df_available("single_token\n"), None);
+    }
+
+    #[test]
+    fn test_is_retryable_error_classification() {
+        // Retryable errors
+        assert!(is_retryable_error("İndirme hatası (data.pak): connection timeout"));
+        assert!(is_retryable_error("Ağ okuma hatası (data.pak): unexpected EOF"));
+        assert!(is_retryable_error(
+            "SHA-256 doğrulama hatası (data.pak): beklenen abc, alınan def"
+        ));
+        assert!(is_retryable_error(
+            "CDN HTTP hatası (data.pak): HTTP status server error (500 Internal Server Error)"
+        ));
+        assert!(is_retryable_error(
+            "CDN HTTP hatası (data.pak): HTTP status server error (502 Bad Gateway)"
+        ));
+        assert!(is_retryable_error(
+            "CDN HTTP hatası (data.pak): HTTP status server error (503 Service Unavailable)"
+        ));
+
+        // Non-retryable errors
+        assert!(!is_retryable_error(
+            "CDN HTTP hatası (data.pak): HTTP status client error (404 Not Found)"
+        ));
+        assert!(!is_retryable_error(
+            "CDN HTTP hatası (data.pak): HTTP status client error (403 Forbidden)"
+        ));
+        assert!(!is_retryable_error(
+            "CDN HTTP hatası (data.pak): HTTP status client error (400 Bad Request)"
+        ));
+        assert!(!is_retryable_error("İndirme iptal edildi"));
+        assert!(!is_retryable_error(
+            "Disk yazma hatası (data.pak): No space left on device"
+        ));
+        assert!(!is_retryable_error(
+            "Dosya oluşturulamadı (data.pak): Permission denied"
+        ));
+    }
+
+    #[test]
+    fn test_retry_success_on_retry() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut count = 0;
+        let res = run_with_retry(
+            || {
+                count += 1;
+                if count < 2 {
+                    Err("Ağ okuma hatası (test): connection reset".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+            &cancel,
+            &[Duration::ZERO, Duration::ZERO],
+        );
+        assert!(res.is_ok());
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_retry_exhausted_appends_suffix() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut count = 0;
+        let res = run_with_retry(
+            || {
+                count += 1;
+                Err("SHA-256 doğrulama hatası (test): beklenen a, alınan b".to_string())
+            },
+            &cancel,
+            &[Duration::ZERO, Duration::ZERO],
+        );
+        assert_eq!(count, 3);
+        match res {
+            Err(e) => {
+                assert!(e.ends_with("(3 deneme sonrası)"));
+                assert!(e.starts_with("SHA-256 doğrulama hatası (test):"));
+            }
+            Ok(_) => panic!("Expected error after 3 attempts"),
+        }
+    }
+
+    #[test]
+    fn test_retry_4xx_does_not_retry() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut count = 0;
+        let res = run_with_retry(
+            || {
+                count += 1;
+                Err("CDN HTTP hatası (test): HTTP status client error (404 Not Found)".to_string())
+            },
+            &cancel,
+            &[Duration::ZERO, Duration::ZERO],
+        );
+        assert_eq!(count, 1);
+        match res {
+            Err(e) => {
+                assert!(!e.contains("(3 deneme sonrası)"));
+                assert_eq!(
+                    e,
+                    "CDN HTTP hatası (test): HTTP status client error (404 Not Found)"
+                );
+            }
+            Ok(_) => panic!("Expected error on 404"),
+        }
+    }
+
+    #[test]
+    fn test_retry_cancel_aborts_immediately() {
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut count = 0;
+        let res = run_with_retry(
+            || {
+                count += 1;
+                Ok(())
+            },
+            &cancel,
+            &[Duration::ZERO, Duration::ZERO],
+        );
+        assert_eq!(count, 0);
+        assert_eq!(res.unwrap_err(), "İndirme iptal edildi");
+    }
 }

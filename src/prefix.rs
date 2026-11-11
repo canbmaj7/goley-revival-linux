@@ -121,7 +121,7 @@ pub fn select_runner(preferred_id: &str) -> Option<RunnerOption> {
     runners.into_iter().next()
 }
 
-fn find_umu_bin() -> Option<PathBuf> {
+pub(crate) fn find_umu_bin() -> Option<PathBuf> {
     if let Some(home) = dirs::home_dir() {
         let faugus_umu = home.join(".local/share/faugus-launcher/umu-run");
         if faugus_umu.is_file() {
@@ -144,7 +144,7 @@ fn find_umu_bin() -> Option<PathBuf> {
     None
 }
 
-fn find_proton_dirs() -> Vec<PathBuf> {
+pub(crate) fn find_proton_dirs() -> Vec<PathBuf> {
     let mut dirs_found = Vec::new();
     let mut roots = vec![
         PathBuf::from("/usr/share/steam/compatibilitytools.d"),
@@ -181,21 +181,32 @@ fn find_proton_dirs() -> Vec<PathBuf> {
 }
 
 pub fn resolve_wine_user_dir(prefix: &Path) -> PathBuf {
+    let sys_user = std::env::var("USER").unwrap_or_else(|_| "steamuser".to_string());
+    resolve_wine_user_dir_for(prefix, &sys_user)
+}
+
+pub(crate) fn resolve_wine_user_dir_for(prefix: &Path, sys_user: &str) -> PathBuf {
     let users = prefix.join("drive_c/users");
     let steamuser = users.join("steamuser");
-    let sys_user = std::env::var("USER").unwrap_or_else(|_| "steamuser".to_string());
-    let local_user = users.join(&sys_user);
+    let local_user = users.join(sys_user);
 
-    // Check which user dir already has Revival installed
-    for candidate in [&steamuser, &local_user] {
-        if candidate
-            .join("AppData/Local/Programs/Revival/revival_launcher.exe")
-            .is_file()
-        {
-            return candidate.clone();
-        }
+    // 1. users/steamuser has Revival installed
+    if steamuser
+        .join("AppData/Local/Programs/Revival/revival_launcher.exe")
+        .is_file()
+    {
+        return steamuser;
     }
 
+    // 2. users/<sys_user> has Revival installed (legacy installs)
+    if local_user
+        .join("AppData/Local/Programs/Revival/revival_launcher.exe")
+        .is_file()
+    {
+        return local_user;
+    }
+
+    // 3. Any other directory under users/ has Revival installed
     if let Ok(entries) = fs::read_dir(&users) {
         for entry in entries.flatten() {
             let p = entry.path();
@@ -207,12 +218,7 @@ pub fn resolve_wine_user_dir(prefix: &Path) -> PathBuf {
         }
     }
 
-    if steamuser.is_dir() {
-        return steamuser;
-    }
-    if local_user.is_dir() {
-        return local_user;
-    }
+    // 4. Default if no installation found: always users/steamuser (even if it does not exist)
     steamuser
 }
 
@@ -466,4 +472,127 @@ pub fn find_running_pids() -> (Option<u32>, Option<u32>) {
     }
 
     (game_pid, launcher_pid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TempDirGuard {
+        path: PathBuf,
+    }
+
+    impl TempDirGuard {
+        fn new(name: &str) -> Self {
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "goley_prefix_test_{}_{}_{}_{}",
+                std::process::id(),
+                name,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+                id
+            ));
+            let _ = fs::remove_dir_all(&path);
+            let _ = fs::create_dir_all(&path);
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn test_scenario_only_steamuser_has_installation() {
+        let t = TempDirGuard::new("only_steamuser");
+        let users = t.path().join("drive_c/users");
+        let _ = fs::create_dir_all(users.join("kullanici"));
+        let steam_launcher_dir = users.join("steamuser/AppData/Local/Programs/Revival");
+        let _ = fs::create_dir_all(&steam_launcher_dir);
+        let _ = fs::write(steam_launcher_dir.join("revival_launcher.exe"), b"");
+
+        let resolved = resolve_wine_user_dir_for(t.path(), "kullanici");
+        assert_eq!(resolved, users.join("steamuser"));
+    }
+
+    #[test]
+    fn test_scenario_only_user_has_installation() {
+        let t = TempDirGuard::new("only_user");
+        let users = t.path().join("drive_c/users");
+        let user_launcher_dir = users.join("kullanici/AppData/Local/Programs/Revival");
+        let _ = fs::create_dir_all(&user_launcher_dir);
+        let _ = fs::write(user_launcher_dir.join("revival_launcher.exe"), b"");
+        let _ = fs::create_dir_all(users.join("steamuser"));
+
+        let resolved = resolve_wine_user_dir_for(t.path(), "kullanici");
+        assert_eq!(resolved, users.join("kullanici"));
+    }
+
+    #[test]
+    fn test_scenario_both_have_installation_prefers_steamuser() {
+        let t = TempDirGuard::new("both_have_install");
+        let users = t.path().join("drive_c/users");
+        let steam_launcher_dir = users.join("steamuser/AppData/Local/Programs/Revival");
+        let _ = fs::create_dir_all(&steam_launcher_dir);
+        let _ = fs::write(steam_launcher_dir.join("revival_launcher.exe"), b"");
+
+        let user_launcher_dir = users.join("kullanici/AppData/Local/Programs/Revival");
+        let _ = fs::create_dir_all(&user_launcher_dir);
+        let _ = fs::write(user_launcher_dir.join("revival_launcher.exe"), b"");
+
+        let resolved = resolve_wine_user_dir_for(t.path(), "kullanici");
+        assert_eq!(resolved, users.join("steamuser"));
+    }
+
+    #[test]
+    fn test_scenario_no_installation_both_dirs_exist_prefers_steamuser() {
+        let t = TempDirGuard::new("no_install_both_dirs");
+        let users = t.path().join("drive_c/users");
+        let _ = fs::create_dir_all(users.join("kullanici"));
+        let _ = fs::create_dir_all(users.join("steamuser"));
+
+        let resolved = resolve_wine_user_dir_for(t.path(), "kullanici");
+        assert_eq!(resolved, users.join("steamuser"));
+    }
+
+    #[test]
+    fn test_scenario_users_dir_is_empty_returns_steamuser() {
+        let t = TempDirGuard::new("users_empty");
+        let users = t.path().join("drive_c/users");
+        let _ = fs::create_dir_all(&users);
+
+        let resolved = resolve_wine_user_dir_for(t.path(), "kullanici");
+        assert_eq!(resolved, users.join("steamuser"));
+        assert!(!resolved.exists());
+    }
+
+    #[test]
+    fn test_users_dir_does_not_exist_returns_steamuser() {
+        let t = TempDirGuard::new("no_users_dir");
+        let expected = t.path().join("drive_c/users/steamuser");
+        let resolved = resolve_wine_user_dir_for(t.path(), "kullanici");
+        assert_eq!(resolved, expected);
+        assert!(!resolved.exists());
+    }
+
+    #[test]
+    fn test_resolve_wine_user_dir_wrapper() {
+        let t = TempDirGuard::new("wrapper");
+        let users = t.path().join("drive_c/users");
+        let _ = fs::create_dir_all(&users);
+
+        let resolved = resolve_wine_user_dir(t.path());
+        assert_eq!(resolved, users.join("steamuser"));
+    }
 }

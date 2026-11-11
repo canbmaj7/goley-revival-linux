@@ -23,8 +23,19 @@ pub fn open_uri_or_path(parent: &impl IsA<gtk::Window>, uri: &str) {
 
 pub fn open_local_folder(parent: &impl IsA<gtk::Window>, path: &Path) {
     let _ = fs::create_dir_all(path);
-    let uri = format!("file://{}", path.display());
-    open_uri_or_path(parent, &uri);
+    // Masaüstü portalı (UriLauncher) KDE'de klasörleri sessizce açamayabiliyor;
+    // önce xdg-open dene, olmazsa eski yönteme dön.
+    let spawned = std::process::Command::new("xdg-open")
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok();
+    if !spawned {
+        let uri = format!("file://{}", path.display());
+        open_uri_or_path(parent, &uri);
+    }
 }
 
 pub fn present_login_dialog<F>(
@@ -718,10 +729,18 @@ pub fn present_preferences_dialog<FRepair, FVerify>(
             btn.set_sensitive(false);
             btn.set_label("Kuruluyor...");
             let pfx = cfg.borrow().prefix_path.clone();
+            let wine_user = crate::prefix::resolve_wine_user_dir(&pfx);
+            let user_name = wine_user
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("steamuser")
+                .to_string();
             let (tx, rx) = async_channel::bounded(1);
             std::thread::spawn(move || {
                 let res = Command::new("winetricks")
                     .env("WINEPREFIX", &pfx)
+                    .env("USER", &user_name)
+                    .env("LOGNAME", &user_name)
                     .args(["-q", "physx"])
                     .status();
                 let _ = tx.send_blocking(res.map(|s| s.success()).unwrap_or(false));
@@ -768,6 +787,23 @@ pub fn present_preferences_dialog<FRepair, FVerify>(
     row_self_upd.add_suffix(&btn_self_upd);
     group_fixes.add(&row_self_upd);
 
+    let row_health = adw::ActionRow::builder()
+        .title("Sistem Kontrolü")
+        .subtitle("Wine, UMU, Proton, Vulkan ve sistem bağımlılıklarının sağlık durumu")
+        .build();
+    let btn_health = gtk::Button::with_label("Denetle");
+    btn_health.set_valign(gtk::Align::Center);
+    {
+        let win_weak = window.downgrade();
+        btn_health.connect_clicked(move |_| {
+            if let Some(w) = win_weak.upgrade() {
+                crate::ui::health::show_health_dialog(&w);
+            }
+        });
+    }
+    row_health.add_suffix(&btn_health);
+    group_fixes.add(&row_health);
+
     page_maint.add(&group_fixes);
 
     let group_debug = adw::PreferencesGroup::builder()
@@ -789,6 +825,24 @@ pub fn present_preferences_dialog<FRepair, FVerify>(
         });
     }
     group_debug.add(&sw_debug_win);
+
+    let row_log_pack = adw::ActionRow::builder()
+        .title("Log Paketini Kopyala")
+        .subtitle("Sistem bilgileri, launcher.log ve runner.log kayıtlarını gizlilik korumalı olarak panoya kopyalar")
+        .build();
+    let btn_log_pack = gtk::Button::with_label("Kopyala");
+    btn_log_pack.set_valign(gtk::Align::Center);
+    {
+        let cfg = Rc::clone(config_rc);
+        let toast_ov = toast_overlay.clone();
+        btn_log_pack.connect_clicked(move |_| {
+            let c = cfg.borrow();
+            crate::ui::log_pack::copy_log_package_to_clipboard(&c.prefix_path, &c.runner_id);
+            toast_ov.add_toast(adw::Toast::new("Log paketi panoya kopyalandı"));
+        });
+    }
+    row_log_pack.add_suffix(&btn_log_pack);
+    group_debug.add(&row_log_pack);
     page_maint.add(&group_debug);
 
     prefs.add(&page_maint);
